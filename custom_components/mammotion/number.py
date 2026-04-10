@@ -18,6 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pymammotion.data.model.device_limits import DeviceLimits
+from pymammotion.utility.device_config import DeviceConfig
 from pymammotion.utility.device_type import DeviceType
 
 from . import MammotionConfigEntry
@@ -87,6 +88,7 @@ YUKA_NUMBER_ENTITIES: tuple[MammotionConfigNumberEntityDescription, ...] = (
 LUBA_WORKING_ENTITIES: tuple[MammotionConfigNumberEntityDescription, ...] = (
     MammotionConfigNumberEntityDescription(
         key="blade_height",
+        device_class=NumberDeviceClass.DISTANCE,
         native_unit_of_measurement=UnitOfLength.MILLIMETERS,
         step=1,
         min_value=25,
@@ -98,22 +100,6 @@ LUBA_WORKING_ENTITIES: tuple[MammotionConfigNumberEntityDescription, ...] = (
         set_async_fn=lambda coordinator,
         value: coordinator.async_modify_plan_if_mowing(),
         get_fn=lambda coordinator: coordinator.operation_settings.blade_height,
-    ),
-    MammotionConfigNumberEntityDescription(
-        key="blade_height_inches",
-        native_unit_of_measurement=UnitOfLength.INCHES,
-        step=0.01,
-        min_value=1.0,
-        max_value=4.0,
-        mode=NumberMode.SLIDER,
-        set_fn=lambda coordinator, value: setattr(
-            coordinator.operation_settings, "blade_height", round(value * 25.4)
-        ),
-        set_async_fn=lambda coordinator,
-        value: coordinator.async_modify_plan_if_mowing(),
-        get_fn=lambda coordinator: round(
-            coordinator.operation_settings.blade_height / 25.4, 2
-        ),
     ),
 )
 
@@ -155,8 +141,9 @@ async def async_setup_entry(
     mammotion_devices = entry.runtime_data.mowers
 
     for mower in mammotion_devices:
-        limits = mower.device_limits
-
+        limits = DeviceConfig().get_working_parameters(mower.device.product_key)
+        if handle := mower.api.get_device_by_name(mower.name):
+            limits = handle.device_limits
         entities: list[MammotionConfigNumberEntity] = []
 
         for entity_description in NUMBER_WORKING_ENTITIES:
@@ -255,13 +242,6 @@ class MammotionWorkingNumberEntity(MammotionConfigNumberEntity):
         if hasattr(limits, entity_description.key):
             self._attr_native_min_value = getattr(limits, entity_description.key).min
             self._attr_native_max_value = getattr(limits, entity_description.key).max
-        elif entity_description.key == "blade_height_inches":
-            self._attr_native_min_value = round(
-                getattr(limits, "blade_height").min / 25.4, 2
-            )
-            self._attr_native_max_value = round(
-                getattr(limits, "blade_height").max / 25.4, 2
-            )
         else:
             # Fallback to the values from entity_description
             self._attr_native_min_value = entity_description.min_value

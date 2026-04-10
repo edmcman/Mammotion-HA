@@ -206,10 +206,9 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
 
             if answer_sdp:
                 # Send the answer back to the browser
-
+                self.coordinator._active_webrtc_sessions += 1
                 send_message(WebRTCAnswer(answer_sdp))
                 _LOGGER.info("WebRTC negotiation completed successfully")
-                # Send set_client_role after successful join
             else:
                 send_message(WebRTCError("500", "WebRTC negotiation failed"))
 
@@ -231,6 +230,9 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
     @callback
     async def async_close_webrtc_session(self, session_id: str) -> None:
         """Close WebRTC session."""
+        self.coordinator._active_webrtc_sessions = max(
+            0, self.coordinator._active_webrtc_sessions - 1
+        )
         await self._agora_handler.disconnect()
 
     async def _perform_webrtc_negotiation(

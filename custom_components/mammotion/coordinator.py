@@ -119,6 +119,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):
         self._stream_data: Response[StreamSubscriptionResponse] | None = (
             None  # Stream data [Agora]
         )
+        self._active_webrtc_sessions: int = 0
         _mammotion_data = config_entry.data.get(CONF_MAMMOTION_DATA) or {}
         try:
             _user_account = int(

@@ -55,8 +55,10 @@ async def capture_agora_snapshot(
         _LOGGER.warning("Snapshot: no stream data available")
         return None
 
-    # Ask the device to start its WebRTC session
-    await coordinator.join_webrtc_channel()
+    # Only start the device stream if no active WebRTC session is running
+    stream_was_inactive = coordinator._active_webrtc_sessions <= 0
+    if stream_was_inactive:
+        await coordinator.join_webrtc_channel()
 
     # Build ICE server list from Agora TURN servers
     ice_servers: list[RTCIceServer] = []
@@ -146,6 +148,8 @@ async def capture_agora_snapshot(
         await pc.close()
         if handler is not None:
             await handler.disconnect()
+        if stream_was_inactive:
+            await coordinator.leave_webrtc_channel()
 
 
 # ---------------------------------------------------------------------------

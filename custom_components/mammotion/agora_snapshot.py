@@ -19,6 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 _TRACK_TIMEOUT = 5
 _FRAME_TIMEOUT = 7
 _ICE_GATHER_TIMEOUT = 3
+_SNAPSHOT_LOCK = asyncio.Lock()
 _CANDIDATE_RE = re.compile(r"^a=(candidate:.+)$", re.MULTILINE)
 
 # HEVC NAL unit types (RFC 7798)
@@ -175,217 +176,218 @@ async def capture_agora_snapshot(
         _LOGGER.error("aiortc is not installed")
         return None
 
-    stream_data, agora_response = await coordinator.async_check_stream_expiry()
-    if not stream_data or stream_data.data is None:
-        _LOGGER.warning("Snapshot: no stream data available")
-        return None
-
-    stream_was_inactive = coordinator._active_webrtc_sessions <= 0
-    if stream_was_inactive:
-        await coordinator.join_webrtc_channel()
-
-    ice_servers: list[RTCIceServer] = []
-    if agora_response:
-        ice_servers = [
-            RTCIceServer(urls=s.urls, username=s.username, credential=s.credential)
-            for s in agora_response.get_ice_servers(use_all_turn_servers=False)
-        ]
-
-    config = RTCConfiguration(iceServers=ice_servers) if ice_servers else None
-    pc = RTCPeerConnection(configuration=config)
-
-    video_track_event: asyncio.Event = asyncio.Event()
-    conn_event: asyncio.Event = asyncio.Event()
-
-    @pc.on("track")
-    def on_track(track: Any) -> None:
-        if track.kind == "video":
-            video_track_event.set()
-
-    @pc.on("connectionstatechange")
-    def on_conn_state() -> None:
-        _LOGGER.debug("Snapshot: connection state -> %s", pc.connectionState)
-        if pc.connectionState == "connected":
-            conn_event.set()
-
-    handler = None
-    try:
-        pc.addTransceiver("video", direction="recvonly")
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        await _wait_for_ice_gathering(pc)
-
-        offer_sdp = pc.localDescription.sdp
-        our_candidates = _extract_candidates_from_sdp(offer_sdp)
-
-        from .agora_websocket import AgoraWebSocketHandler  # noqa: PLC0415
-        from webrtc_models import RTCIceCandidateInit  # noqa: PLC0415
-
-        handler = AgoraWebSocketHandler(hass)
-        for cand in our_candidates:
-            cand_line = (
-                f"candidate:{cand['foundation']} 1 {cand['protocol']} "
-                f"{cand['priority']} {cand['ip']} {cand['port']} "
-                f"typ {cand['type']}"
-            )
-            handler.candidates.append(
-                RTCIceCandidateInit(
-                    candidate=cand_line, sdp_mid="0", sdp_m_line_index=0
-                )
-            )
-
-        answer_sdp = await handler.connect_and_join(
-            stream_data.data,
-            offer_sdp,
-            secrets.token_hex(8),
-            agora_response,
-        )
-
-        if not answer_sdp:
-            _LOGGER.error("Snapshot: no answer SDP received from Agora")
+    async with _SNAPSHOT_LOCK:
+        stream_data, agora_response = await coordinator.async_check_stream_expiry()
+        if not stream_data or stream_data.data is None:
+            _LOGGER.warning("Snapshot: no stream data available")
             return None
 
-        await pc.setRemoteDescription(
-            RTCSessionDescription(sdp=answer_sdp, type="answer")
-        )
+        stream_was_inactive = coordinator._active_webrtc_sessions <= 0
+        if stream_was_inactive:
+            await coordinator.join_webrtc_channel()
 
+        ice_servers: list[RTCIceServer] = []
         if agora_response:
-            for addr in agora_response.get_gateway_addresses():
-                try:
-                    await pc.addIceCandidate(
-                        RTCIceCandidate(
-                            component=1,
-                            foundation="agora",
-                            ip=addr.ip,
-                            port=addr.port,
-                            priority=2130706431,
-                            protocol="udp",
-                            type="host",
-                            sdpMid="0",
-                            sdpMLineIndex=0,
-                        )
+            ice_servers = [
+                RTCIceServer(urls=s.urls, username=s.username, credential=s.credential)
+                for s in agora_response.get_ice_servers(use_all_turn_servers=False)
+            ]
+
+        config = RTCConfiguration(iceServers=ice_servers) if ice_servers else None
+        pc = RTCPeerConnection(configuration=config)
+
+        video_track_event: asyncio.Event = asyncio.Event()
+        conn_event: asyncio.Event = asyncio.Event()
+
+        @pc.on("track")
+        def on_track(track: Any) -> None:
+            if track.kind == "video":
+                video_track_event.set()
+
+        @pc.on("connectionstatechange")
+        def on_conn_state() -> None:
+            _LOGGER.debug("Snapshot: connection state -> %s", pc.connectionState)
+            if pc.connectionState == "connected":
+                conn_event.set()
+
+        handler = None
+        try:
+            pc.addTransceiver("video", direction="recvonly")
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            await _wait_for_ice_gathering(pc)
+
+            offer_sdp = pc.localDescription.sdp
+            our_candidates = _extract_candidates_from_sdp(offer_sdp)
+
+            from .agora_websocket import AgoraWebSocketHandler  # noqa: PLC0415
+            from webrtc_models import RTCIceCandidateInit  # noqa: PLC0415
+
+            handler = AgoraWebSocketHandler(hass)
+            for cand in our_candidates:
+                cand_line = (
+                    f"candidate:{cand['foundation']} 1 {cand['protocol']} "
+                    f"{cand['priority']} {cand['ip']} {cand['port']} "
+                    f"typ {cand['type']}"
+                )
+                handler.candidates.append(
+                    RTCIceCandidateInit(
+                        candidate=cand_line, sdp_mid="0", sdp_m_line_index=0
                     )
+                )
+
+            answer_sdp = await handler.connect_and_join(
+                stream_data.data,
+                offer_sdp,
+                secrets.token_hex(8),
+                agora_response,
+            )
+
+            if not answer_sdp:
+                _LOGGER.error("Snapshot: no answer SDP received from Agora")
+                return None
+
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=answer_sdp, type="answer")
+            )
+
+            if agora_response:
+                for addr in agora_response.get_gateway_addresses():
+                    try:
+                        await pc.addIceCandidate(
+                            RTCIceCandidate(
+                                component=1,
+                                foundation="agora",
+                                ip=addr.ip,
+                                port=addr.port,
+                                priority=2130706431,
+                                protocol="udp",
+                                type="host",
+                                sdpMid="0",
+                                sdpMLineIndex=0,
+                            )
+                        )
+                    except Exception:
+                        pass
+
+            await asyncio.wait_for(video_track_event.wait(), timeout=_TRACK_TIMEOUT)
+            await asyncio.wait_for(conn_event.wait(), timeout=_TRACK_TIMEOUT)
+
+            # Inject PT=0 routing — the Agora gateway uses PT 0 instead of the
+            # negotiated PT, so we register it manually with the RTP router.
+            receiver = pc.getReceivers()[0] if pc.getReceivers() else None
+            dtls_transport = receiver.transport if receiver else None
+            if dtls_transport and receiver:
+                router = dtls_transport._rtp_router
+                if 0 not in router.payload_type_table:
+                    router.payload_type_table[0] = set()
+                router.payload_type_table[0].add(receiver)
+                router.ssrc_table[40000] = receiver
+
+            # Send PLI to request a keyframe
+            if receiver:
+                try:
+                    await receiver._send_rtcp_pli(40000)
                 except Exception:
                     pass
 
-        await asyncio.wait_for(video_track_event.wait(), timeout=_TRACK_TIMEOUT)
-        await asyncio.wait_for(conn_event.wait(), timeout=_TRACK_TIMEOUT)
+            # Intercept RTP at the DTLS layer, collect one HEVC keyframe,
+            # decode it, and return JPEG.
+            frame_ready: asyncio.Event = asyncio.Event()
+            frame_packets: dict[int, list[tuple[int, bytes]]] = {}
+            jpeg_result: list[bytes | None] = [None]
+            got_keyframe_start = [False]
 
-        # Inject PT=0 routing — the Agora gateway uses PT 0 instead of the
-        # negotiated PT, so we register it manually with the RTP router.
-        receiver = pc.getReceivers()[0] if pc.getReceivers() else None
-        dtls_transport = receiver.transport if receiver else None
-        if dtls_transport and receiver:
-            router = dtls_transport._rtp_router
-            if 0 not in router.payload_type_table:
-                router.payload_type_table[0] = set()
-            router.payload_type_table[0].add(receiver)
-            router.ssrc_table[40000] = receiver
+            if dtls_transport:
+                orig_handle = dtls_transport._handle_rtp_data
 
-        # Send PLI to request a keyframe
-        if receiver:
-            try:
-                await receiver._send_rtcp_pli(40000)
-            except Exception:
-                pass
+                async def _intercept_rtp(
+                    data: bytes,
+                    arrival_time_ms: float,
+                    _orig: Any = orig_handle,
+                ) -> None:
+                    from aiortc.rtp import RtpPacket  # noqa: PLC0415
 
-        # Intercept RTP at the DTLS layer, collect one HEVC keyframe,
-        # decode it, and return JPEG.
-        frame_ready: asyncio.Event = asyncio.Event()
-        frame_packets: dict[int, list[tuple[int, bytes]]] = {}
-        jpeg_result: list[bytes | None] = [None]
-        got_keyframe_start = [False]
-
-        if dtls_transport:
-            orig_handle = dtls_transport._handle_rtp_data
-
-            async def _intercept_rtp(
-                data: bytes,
-                arrival_time_ms: float,
-                _orig: Any = orig_handle,
-            ) -> None:
-                from aiortc.rtp import RtpPacket  # noqa: PLC0415
-
-                if not frame_ready.is_set():
-                    try:
-                        pkt = RtpPacket.parse(
-                            data, dtls_transport._rtp_header_extensions_map
-                        )
-                        ts = pkt.timestamp
-                        payload = pkt.payload
-                        if len(payload) >= 2:
-                            nal_type = (payload[0] >> 1) & 0x3F
-                            is_keyframe_start = False
-                            if nal_type == _HEVC_NAL_AP:
-                                is_keyframe_start = True
-                            elif nal_type == _HEVC_NAL_FU and len(payload) >= 3:
-                                fu_hdr = payload[2]
-                                fu_type = fu_hdr & 0x3F
-                                s_bit = (fu_hdr >> 7) & 1
-                                if s_bit and fu_type in (19, 20):
+                    if not frame_ready.is_set():
+                        try:
+                            pkt = RtpPacket.parse(
+                                data, dtls_transport._rtp_header_extensions_map
+                            )
+                            ts = pkt.timestamp
+                            payload = pkt.payload
+                            if len(payload) >= 2:
+                                nal_type = (payload[0] >> 1) & 0x3F
+                                is_keyframe_start = False
+                                if nal_type == _HEVC_NAL_AP:
                                     is_keyframe_start = True
+                                elif nal_type == _HEVC_NAL_FU and len(payload) >= 3:
+                                    fu_hdr = payload[2]
+                                    fu_type = fu_hdr & 0x3F
+                                    s_bit = (fu_hdr >> 7) & 1
+                                    if s_bit and fu_type in (19, 20):
+                                        is_keyframe_start = True
 
-                            if is_keyframe_start:
-                                got_keyframe_start[0] = True
+                                if is_keyframe_start:
+                                    got_keyframe_start[0] = True
 
-                            if got_keyframe_start[0]:
-                                if ts not in frame_packets:
-                                    frame_packets[ts] = []
-                                frame_packets[ts].append(
-                                    (pkt.sequence_number, bytes(payload))
-                                )
-
-                            # Decode when we see the next timestamp
-                            if (
-                                got_keyframe_start[0]
-                                and len(frame_packets) >= 2
-                                and not frame_ready.is_set()
-                            ):
-                                first_ts = min(frame_packets)
-                                pkts = sorted(
-                                    frame_packets[first_ts], key=lambda x: x[0]
-                                )
-                                annexb = _depacketize_hevc_rtp(pkts)
-                                if annexb:
-                                    jpeg_result[0] = (
-                                        await hass.async_add_executor_job(
-                                            _hevc_annexb_to_jpeg, annexb
-                                        )
+                                if got_keyframe_start[0]:
+                                    if ts not in frame_packets:
+                                        frame_packets[ts] = []
+                                    frame_packets[ts].append(
+                                        (pkt.sequence_number, bytes(payload))
                                     )
-                                    if jpeg_result[0]:
-                                        _LOGGER.info(
-                                            "Snapshot: decoded HEVC keyframe "
-                                            "(%d packets, %d bytes JPEG)",
-                                            len(pkts),
-                                            len(jpeg_result[0]),
+
+                                # Decode when we see the next timestamp
+                                if (
+                                    got_keyframe_start[0]
+                                    and len(frame_packets) >= 2
+                                    and not frame_ready.is_set()
+                                ):
+                                    first_ts = min(frame_packets)
+                                    pkts = sorted(
+                                        frame_packets[first_ts], key=lambda x: x[0]
+                                    )
+                                    annexb = _depacketize_hevc_rtp(pkts)
+                                    if annexb:
+                                        jpeg_result[0] = (
+                                            await hass.async_add_executor_job(
+                                                _hevc_annexb_to_jpeg, annexb
+                                            )
                                         )
-                                frame_ready.set()
-                    except Exception:
-                        _LOGGER.debug(
-                            "Snapshot: RTP intercept error", exc_info=True
-                        )
+                                        if jpeg_result[0]:
+                                            _LOGGER.info(
+                                                "Snapshot: decoded HEVC keyframe "
+                                                "(%d packets, %d bytes JPEG)",
+                                                len(pkts),
+                                                len(jpeg_result[0]),
+                                            )
+                                    frame_ready.set()
+                        except Exception:
+                            _LOGGER.debug(
+                                "Snapshot: RTP intercept error", exc_info=True
+                            )
 
-                await _orig(data, arrival_time_ms)
+                    await _orig(data, arrival_time_ms)
 
-            dtls_transport._handle_rtp_data = _intercept_rtp
+                dtls_transport._handle_rtp_data = _intercept_rtp
 
-        try:
-            await asyncio.wait_for(frame_ready.wait(), timeout=_FRAME_TIMEOUT)
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Snapshot: timed out waiting for HEVC keyframe")
+            try:
+                await asyncio.wait_for(frame_ready.wait(), timeout=_FRAME_TIMEOUT)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Snapshot: timed out waiting for HEVC keyframe")
 
-        return jpeg_result[0]
+            return jpeg_result[0]
 
-    except Exception:
-        _LOGGER.exception("Snapshot: unexpected error during capture")
-        return None
+        except Exception:
+            _LOGGER.exception("Snapshot: unexpected error during capture")
+            return None
 
-    finally:
-        await pc.close()
-        if handler is not None:
-            await handler.disconnect()
-        if stream_was_inactive:
-            await coordinator.leave_webrtc_channel()
+        finally:
+            await pc.close()
+            if handler is not None:
+                await handler.disconnect()
+            if stream_was_inactive:
+                await coordinator.leave_webrtc_channel()
 
 
 async def _wait_for_ice_gathering(pc: Any) -> None:

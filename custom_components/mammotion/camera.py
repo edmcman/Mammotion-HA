@@ -159,7 +159,7 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
             if image is not None:
                 return image
         except Exception:
-            _LOGGER.exception("Failed to capture WebRTC snapshot via aiortc")
+            _LOGGER.exception("Failed to capture snapshot via aiortc")
 
         return await self.hass.async_add_executor_job(self.placeholder_image)
 

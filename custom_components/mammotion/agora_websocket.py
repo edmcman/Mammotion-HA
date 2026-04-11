@@ -1422,9 +1422,9 @@ class AgoraWebSocketHandler:
         if not has_timing:
             _LOGGER.error("SDP missing timing line (t=)")
             return False
-        if m_line_count < 2:
+        if m_line_count < 1:
             _LOGGER.error(
-                "SDP has %s m-lines, expected 2 (audio + video)", m_line_count
+                "SDP has %s m-lines, expected at least 1", m_line_count
             )
             return False
 

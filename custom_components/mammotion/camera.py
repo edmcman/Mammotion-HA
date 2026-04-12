@@ -149,19 +149,16 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return a snapshot from the live WebRTC stream, or a placeholder on failure."""
+        """Return a snapshot from the live WebRTC stream, or None on failure."""
         try:
             from .agora_snapshot import capture_agora_snapshot
 
-            image = await capture_agora_snapshot(
+            return await capture_agora_snapshot(
                 self.hass, self.coordinator, width=width, height=height
             )
-            if image is not None:
-                return image
         except Exception:
             _LOGGER.exception("Failed to capture snapshot via aiortc")
-
-        return await self.hass.async_add_executor_job(self.placeholder_image)
+            return None
 
     @classmethod
     @functools.cache

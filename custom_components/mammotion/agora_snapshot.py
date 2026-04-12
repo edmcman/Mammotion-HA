@@ -152,6 +152,9 @@ def _hevc_annexb_to_jpeg(annexb_data: bytes) -> bytes | None:
     return data if data else None
 
 
+_SNAPSHOT_BUDGET = 9.0  # seconds — must be less than HA's camera proxy timeout (10s)
+
+
 async def capture_agora_snapshot(
     hass: HomeAssistant,
     coordinator: MammotionBaseUpdateCoordinator,
@@ -160,10 +163,26 @@ async def capture_agora_snapshot(
 ) -> bytes | None:
     """Capture a single JPEG frame from the Agora WebRTC stream.
 
-    Opens a server-side WebRTC connection to the Agora channel using aiortc,
-    intercepts RTP packets, depacketizes HEVC (RFC 7798), decodes one keyframe,
-    and encodes it as JPEG.  Returns JPEG bytes or None on failure.
+    Enforces a 9-second overall budget so the result always arrives before
+    Home Assistant's 10-second camera proxy deadline.
     """
+    try:
+        return await asyncio.wait_for(
+            _capture_impl(hass, coordinator, width, height),
+            timeout=_SNAPSHOT_BUDGET,
+        )
+    except asyncio.TimeoutError:
+        _LOGGER.warning("Snapshot: overall budget exceeded (%.0fs)", _SNAPSHOT_BUDGET)
+        return None
+
+
+async def _capture_impl(
+    hass: HomeAssistant,
+    coordinator: MammotionBaseUpdateCoordinator,
+    width: int | None = None,
+    height: int | None = None,
+) -> bytes | None:
+    """Internal implementation — call via capture_agora_snapshot."""
     try:
         from aiortc import (  # noqa: PLC0415
             RTCConfiguration,
@@ -284,13 +303,6 @@ async def capture_agora_snapshot(
                 router.payload_type_table[0].add(receiver)
                 router.ssrc_table[40000] = receiver
 
-            # Send PLI to request a keyframe
-            if receiver:
-                try:
-                    await receiver._send_rtcp_pli(40000)
-                except Exception:
-                    pass
-
             # Intercept RTP at the DTLS layer, collect one HEVC keyframe,
             # decode it, and return JPEG.
             frame_ready: asyncio.Event = asyncio.Event()
@@ -371,10 +383,26 @@ async def capture_agora_snapshot(
 
                 dtls_transport._handle_rtp_data = _intercept_rtp
 
+            # Send PLI immediately, then retry every 2 seconds until keyframe
+            # arrives or timeout expires. A single PLI is often dropped or the
+            # mower's IDR interval exceeds the wait window.
+            async def _pli_loop() -> None:
+                while not frame_ready.is_set():
+                    if receiver:
+                        try:
+                            await receiver._send_rtcp_pli(40000)
+                            _LOGGER.debug("Snapshot: sent PLI requesting keyframe")
+                        except Exception:
+                            pass
+                    await asyncio.sleep(1)
+
+            pli_task = asyncio.ensure_future(_pli_loop())
             try:
                 await asyncio.wait_for(frame_ready.wait(), timeout=_FRAME_TIMEOUT)
             except asyncio.TimeoutError:
                 _LOGGER.warning("Snapshot: timed out waiting for HEVC keyframe")
+            finally:
+                pli_task.cancel()
 
             return jpeg_result[0]
 
